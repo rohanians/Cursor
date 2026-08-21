@@ -3,11 +3,16 @@ import asyncio
 from brain.context.market_state import MarketState
 from market.bybit.public_ws import BybitPublicFeed
 from market.orderflow import OrderFlowEngine
+from market.orderflow.rolling import RollingOrderFlow
 
 
 class LiveMarketSnapshot:
 
-    def __init__(self, symbol: str = "BTCUSDT"):
+    def __init__(
+        self,
+        symbol: str = "BTCUSDT",
+    ):
+
         self.symbol = symbol.upper()
 
         self.feed = BybitPublicFeed(
@@ -17,6 +22,49 @@ class LiveMarketSnapshot:
 
         self.orderflow = OrderFlowEngine()
 
+        self.rolling = RollingOrderFlow()
+
+        self.processed_trade_ids: set[str] = set()
+
+    def _process_new_trades(self):
+
+        trades = self.feed.data.trades
+
+        for trade in trades:
+
+            trade_id = str(
+                trade.get("id")
+            )
+
+            if not trade_id:
+                continue
+
+            if trade_id in self.processed_trade_ids:
+                continue
+
+            self.processed_trade_ids.add(
+                trade_id
+            )
+
+            self.rolling.add_trade(
+                timestamp=(
+                    trade["timestamp"] / 1000
+                ),
+                side=trade["side"],
+                quantity=trade["quantity"],
+            )
+
+        # Keep memory bounded.
+        if len(
+            self.processed_trade_ids
+        ) > 10000:
+
+            self.processed_trade_ids = set(
+                list(
+                    self.processed_trade_ids
+                )[-5000:]
+            )
+
     def build(self) -> MarketState | None:
 
         data = self.feed.data
@@ -24,98 +72,203 @@ class LiveMarketSnapshot:
         if data.price is None:
             return None
 
-        flow = self.orderflow.analyze(
-            trades=data.trades,
-            orderbook_imbalance=data.orderbook_imbalance(),
+        self._process_new_trades()
+
+        imbalance = (
+            data.orderbook_imbalance(
+                depth=20
+            )
         )
 
+        recent_trades = data.trades[-500:]
+
+        flow = self.orderflow.analyze(
+            trades=recent_trades,
+            orderbook_imbalance=imbalance,
+        )
+
+        rolling = self.rolling.snapshot()
+
         return MarketState(
+
             symbol=self.symbol,
+
             timestamp=data.last_update,
+
             price=data.price,
 
             timeframe="realtime",
 
             order_flow={
+
                 "buy_volume": flow.buy_volume,
+
                 "sell_volume": flow.sell_volume,
+
                 "delta": flow.delta,
-                "cumulative_delta": flow.cumulative_delta,
-                "buy_sell_ratio": flow.buy_sell_ratio,
+
+                "cumulative_delta":
+                    flow.cumulative_delta,
+
+                "buy_sell_ratio":
+                    flow.buy_sell_ratio,
+
                 "bias": flow.bias,
-                "aggression": flow.aggression,
-                "absorption": flow.absorption,
+
+                "aggression":
+                    flow.aggression,
+
+                "absorption":
+                    flow.absorption,
+
+                "rolling": {
+                    str(window): vars(snapshot)
+                    for window, snapshot
+                    in rolling.items()
+                },
             },
 
             orderbook={
-                "imbalance": flow.orderbook_imbalance,
-                "bid_levels": len(data.bids),
-                "ask_levels": len(data.asks),
+
+                "imbalance": imbalance,
+
+                "bid_levels":
+                    len(data.bids),
+
+                "ask_levels":
+                    len(data.asks),
+
+                "best_bid": (
+                    data.sorted_bids(1)[0][0]
+                    if data.sorted_bids(1)
+                    else None
+                ),
+
+                "best_ask": (
+                    data.sorted_asks(1)[0][0]
+                    if data.sorted_asks(1)
+                    else None
+                ),
+
+                "top_bids":
+                    data.snapshot_bids(20),
+
+                "top_asks":
+                    data.snapshot_asks(20),
             },
         )
 
 
 async def main():
 
-    snapshot = LiveMarketSnapshot("BTCUSDT")
+    snapshot = LiveMarketSnapshot(
+        "BTCUSDT"
+    )
 
-    async def feed_loop():
+    feed_task = asyncio.create_task(
+        snapshot.feed.run()
+    )
 
-        await snapshot.feed.run()
+    print()
+    print(
+        "======================================"
+    )
+    print(
+        "        APEX LIVE MARKET FEED"
+    )
+    print(
+        "======================================"
+    )
 
-    asyncio.create_task(feed_loop())
+    try:
 
-    print("Waiting for live market data...")
+        while True:
 
-    while True:
+            state = snapshot.build()
 
-        state = snapshot.build()
+            if state:
 
-        if state:
+                flow = state.order_flow
 
-            print()
-            print("========== LIVE APEX SNAPSHOT ==========")
-            print(f"Symbol:     {state.symbol}")
-            print(f"Price:      {state.price:.2f}")
+                print()
+                print(
+                    "========== LIVE SNAPSHOT =========="
+                )
 
-            print(
-                f"Delta:      "
-                f"{state.order_flow['delta']:.4f}"
-            )
+                print(
+                    f"Symbol:       "
+                    f"{state.symbol}"
+                )
 
-            print(
-                f"CVD:        "
-                f"{state.order_flow['cumulative_delta']:.4f}"
-            )
+                print(
+                    f"Price:        "
+                    f"{state.price:.2f}"
+                )
 
-            print(
-                f"Buy/Sell:   "
-                f"{state.order_flow['buy_sell_ratio']:.2f}"
-            )
+                print(
+                    f"Delta:        "
+                    f"{flow['delta']:+.4f}"
+                )
 
-            print(
-                f"OB Imbal:   "
-                f"{state.orderbook['imbalance']:+.3f}"
-            )
+                print(
+                    f"CVD:          "
+                    f"{flow['cumulative_delta']:+.4f}"
+                )
 
-            print(
-                f"Bias:       "
-                f"{state.order_flow['bias']}"
-            )
+                print(
+                    f"Buy/Sell:     "
+                    f"{flow['buy_sell_ratio']:.2f}"
+                )
 
-            print(
-                f"Aggression: "
-                f"{state.order_flow['aggression']}"
-            )
+                print(
+                    f"OB Imbalance: "
+                    f"{state.orderbook['imbalance']:+.3f}"
+                )
 
-            print(
-                f"Absorption: "
-                f"{state.order_flow['absorption']}"
-            )
+                print(
+                    f"Bias:         "
+                    f"{flow['bias']}"
+                )
 
-            print("========================================")
+                print(
+                    f"Aggression:   "
+                    f"{flow['aggression']}"
+                )
 
-        await asyncio.sleep(2)
+                print(
+                    f"Absorption:   "
+                    f"{flow['absorption']}"
+                )
+
+                print(
+                    f"Book levels:  "
+                    f"{state.orderbook['bid_levels']}/"
+                    f"{state.orderbook['ask_levels']}"
+                )
+
+                print(
+                    "=================================="
+                )
+
+            await asyncio.sleep(2)
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "Stopping APEX live feed..."
+        )
+
+    finally:
+
+        snapshot.feed.stop()
+
+        feed_task.cancel()
+
+        try:
+            await feed_task
+        except asyncio.CancelledError:
+            pass
 
 
 if __name__ == "__main__":

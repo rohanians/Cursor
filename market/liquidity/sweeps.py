@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -6,62 +7,136 @@ class LiquiditySweep:
     detected: bool
     direction: str
     level: float | None
+
+    sweep_price: float | None
+
     reclaim: bool
     rejection: bool
+
     strength: float
+
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "detected": self.detected,
+            "direction": self.direction,
+            "level": self.level,
+            "sweep_price": self.sweep_price,
+            "reclaim": self.reclaim,
+            "rejection": self.rejection,
+            "strength": self.strength,
+            "reason": self.reason,
+        }
 
 
 class LiquiditySweepDetector:
+    """
+    Detects price taking a known liquidity level.
+
+    A sweep alone is NOT an entry.
+    Confirmation is required.
+    """
 
     def detect(
         self,
         price: float,
-        previous_low: float | None,
-        previous_high: float | None,
-        delta: float,
+        previous_low: float | None = None,
+        previous_high: float | None = None,
+        delta: float = 0.0,
+        tolerance_pct: float = 0.0005,
     ) -> LiquiditySweep:
 
-        if previous_low is not None and price < previous_low:
+        if price <= 0:
 
-            reclaim = price > previous_low
-
-            strength = min(
-                abs(delta) / max(abs(price), 1),
-                1.0,
+            return self._none(
+                "Invalid price"
             )
 
-            return LiquiditySweep(
-                detected=True,
-                direction="sell_side",
-                level=previous_low,
-                reclaim=reclaim,
-                rejection=True,
-                strength=strength,
+        # =====================================================
+        # SELL-SIDE LIQUIDITY
+        # =====================================================
+
+        if previous_low is not None:
+
+            low = float(previous_low)
+
+            tolerance = (
+                abs(low) * tolerance_pct
             )
 
-        if previous_high is not None and price > previous_high:
+            if price < low:
 
-            reclaim = price < previous_high
+                strength = min(
+                    1.0,
+                    abs(price - low)
+                    / max(tolerance, 1e-9),
+                )
 
-            strength = min(
-                abs(delta) / max(abs(price), 1),
-                1.0,
+                return LiquiditySweep(
+                    detected=True,
+                    direction="sell_side",
+                    level=low,
+                    sweep_price=price,
+                    reclaim=False,
+                    rejection=True,
+                    strength=strength,
+                    reason=(
+                        "Price traded below "
+                        "previous swing low"
+                    ),
+                )
+
+        # =====================================================
+        # BUY-SIDE LIQUIDITY
+        # =====================================================
+
+        if previous_high is not None:
+
+            high = float(previous_high)
+
+            tolerance = (
+                abs(high) * tolerance_pct
             )
 
-            return LiquiditySweep(
-                detected=True,
-                direction="buy_side",
-                level=previous_high,
-                reclaim=reclaim,
-                rejection=True,
-                strength=strength,
-            )
+            if price > high:
+
+                strength = min(
+                    1.0,
+                    abs(price - high)
+                    / max(tolerance, 1e-9),
+                )
+
+                return LiquiditySweep(
+                    detected=True,
+                    direction="buy_side",
+                    level=high,
+                    sweep_price=price,
+                    reclaim=False,
+                    rejection=True,
+                    strength=strength,
+                    reason=(
+                        "Price traded above "
+                        "previous swing high"
+                    ),
+                )
+
+        return self._none(
+            "No liquidity sweep"
+        )
+
+    @staticmethod
+    def _none(
+        reason: str,
+    ) -> LiquiditySweep:
 
         return LiquiditySweep(
             detected=False,
             direction="none",
             level=None,
+            sweep_price=None,
             reclaim=False,
             rejection=False,
             strength=0.0,
+            reason=reason,
         )
